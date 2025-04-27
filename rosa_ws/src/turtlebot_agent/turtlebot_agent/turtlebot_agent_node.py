@@ -26,6 +26,11 @@ class TurtleBotAgentNode(Node):
         # Initialize CV Bridge for image processing
         self.bridge = CvBridge()
         
+        # Flag to control active camera threads
+        self.camera_active = False
+        self.camera_thread = None
+        self.camera_lock = threading.Lock()  # Add a lock for thread safety
+        
         # ============================= SETUP AGENT =============================
         # Setup the agent
         self.setup_agent()
@@ -186,56 +191,98 @@ class TurtleBotAgentNode(Node):
         @tool
         def get_robot_camera_image() -> dict:
             """
-            Display a live stream from the TurtleBot's RGB camera (/turtlebot_rgb).
-            Press 'q' to close the stream window.
+            Display a live stream from the TurtleBot's RGB camera (/turtlebot_rgb) in a non-blocking way.
+            Press 'q' in the camera window to close the stream.
             """
-            streaming = {"running": True}
-            last_frame = {"image": None}
+            with node_instance.camera_lock:
+                # Check if camera is already running
+                if node_instance.camera_active:
+                    return {"message": "Camera is already running. Use 'stop_camera' to stop it first if needed."}
+                
+                # Function to run in a separate thread
+                def camera_thread_function():
+                    streaming = {"running": True}
+                    last_frame = {"image": None}
+                    sub = None
 
-            def image_callback(msg):
-                try:
-                    cv_image = node_instance.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-                    resized_image = cv2.resize(cv_image, (250, 250))
-                    last_frame["image"] = resized_image
-                except Exception as e:
-                    node_instance.get_logger().error(f"Image conversion failed: {str(e)}")
+                    try:
+                        def image_callback(msg):
+                            try:
+                                cv_image = node_instance.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                                resized_image = cv2.resize(cv_image, (250, 250))
+                                last_frame["image"] = resized_image
+                            except Exception as e:
+                                node_instance.get_logger().error(f"Image conversion failed: {str(e)}")
 
-            sub = node_instance.create_subscription(
-                Image,
-                "/turtlebot_rgb",
-                image_callback,
-                10
-            )
+                        sub = node_instance.create_subscription(
+                            Image,
+                            "/turtlebot_rgb",
+                            image_callback,
+                            10
+                        )
 
-            node_instance.get_logger().info("📷 Live streaming camera... Press 'q' to quit.")
-            result = {}
+                        node_instance.get_logger().info("📷 Live streaming camera... Press 'q' to quit.")
+                        
+                        # Keep checking if we should continue running
+                        while node_instance.camera_active and rclpy.ok():
+                            frame = last_frame["image"]
+                            if frame is not None:
+                                cv2.imshow("Live TurtleBot Camera View", frame)
+                                key = cv2.waitKey(1)
+                                if key == ord('q'):
+                                    break
+                            # Small sleep to prevent high CPU usage
+                            time.sleep(0.01)
 
-            try:
-                while rclpy.ok() and streaming["running"]:
-                    rclpy.spin_once(node_instance, timeout_sec=0.01)
+                    except Exception as e:
+                        node_instance.get_logger().error(f"Camera thread error: {str(e)}")
+                    finally:
+                        # Clean up resources
+                        with node_instance.camera_lock:
+                            node_instance.camera_active = False
+                        
+                        if sub is not None:
+                            node_instance.destroy_subscription(sub)
+                        cv2.destroyAllWindows()
+                        node_instance.get_logger().info("Camera thread stopped")
 
-                    frame = last_frame["image"]
-                    if frame is not None:
-                        cv2.imshow("Live TurtleBot Camera View", frame)
-                        key = cv2.waitKey(1)
-                        if key == ord('q'):
-                            streaming["running"] = False
-            except Exception as e:
-                result["error"] = f"Error during streaming: {str(e)}"
-            finally:
-                node_instance.destroy_subscription(sub)
-                cv2.destroyAllWindows()
-                if "error" not in result:
-                    result["message"] = "Stopped live stream."
-
-            return result
+                # Set the flag and start the thread
+                node_instance.camera_active = True
+                node_instance.camera_thread = threading.Thread(target=camera_thread_function)
+                node_instance.camera_thread.daemon = True  # Thread will exit when main program exits
+                node_instance.camera_thread.start()
+                
+                return {"message": "📷 Live camera stream started in a separate window. Press 'q' in the camera window to close."}
+            
+        @tool
+        def stop_camera() -> dict:
+            """
+            Stop the currently running camera stream if active.
+            """
+            with node_instance.camera_lock:
+                if not node_instance.camera_active:
+                    return {"message": "No active camera stream to stop."}
+                
+                # Signal the thread to stop
+                node_instance.camera_active = False
+            
+            # Wait for thread to finish with timeout
+            if node_instance.camera_thread is not None and node_instance.camera_thread.is_alive():
+                node_instance.camera_thread.join(timeout=2.0)
+                node_instance.camera_thread = None
+                
+            # Make sure all OpenCV windows are closed
+            cv2.destroyAllWindows()
+                
+            return {"message": "Camera stream stopped successfully."}
             
         # Return all tools
         return [
             publish_linear_motion,
             publish_angular_motion,
             get_turtle_pose,
-            get_robot_camera_image
+            get_robot_camera_image,
+            stop_camera
         ]
 
 
@@ -253,11 +300,26 @@ def main(args=None):
                 break
             response = node.agent.invoke(user_input)
             print(f"🤖 ROSA: {response}")
+            
+            # Ensure ROS callbacks are processed even during the command loop
+            rclpy.spin_once(node, timeout_sec=0.01)
+            
     except KeyboardInterrupt:
         print("\n[!] Interrupted. Shutting down.")
-
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        # Make sure to clean up the camera thread if it's running
+        with node.camera_lock:
+            if node.camera_active:
+                node.camera_active = False
+                
+        if node.camera_thread is not None and node.camera_thread.is_alive():
+            node.camera_thread.join(timeout=1.0)
+            
+        # Make sure all OpenCV windows are closed
+        cv2.destroyAllWindows()
+            
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
