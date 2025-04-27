@@ -14,32 +14,82 @@ import cv2
 from cv_bridge import CvBridge
 import threading
 
+
 class TurtleBotAgentNode(Node):
     def __init__(self):
         super().__init__('turtlebot_agent_node')
-
-        # self.publisher_ = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
-        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
-
         
+        # ============================= INITIALIZE NODE =============================
+        # Initialize publishers
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # Initialize CV Bridge for image processing
         self.bridge = CvBridge()
         
+        # ============================= SETUP AGENT =============================
+        # Setup the agent
+        self.setup_agent()
+        
+        self.get_logger().info("ROSA TurtleBot Agent is ready. Type a command:")
 
-# ============================= Setup local LLM (Ollama) =============================
+    def setup_agent(self):
+        """Setup the ROSA agent with LLM and tools"""
+        # ============================= INITIALIZE LLM =============================
+        # Initialize the local LLM (Ollama)
+        local_llm = self._initialize_llm()
+        
+        # ============================= DEFINE TOOLS & PROMPTS =============================
+        # Define tools
+        tools = self._create_tools()
+        
+        # Setup agent prompts
+        prompts = self._create_prompts()
+        
+        # ============================= INITIALIZE ROSA AGENT =============================
+        # Initialize ROSA
+        self.agent = ROSA(
+            ros_version=2,
+            llm=local_llm,
+            tools=tools,
+            prompts=prompts
+        )
 
-        local_llm = ChatOllama(
+    def _initialize_llm(self):
+        """Initialize and configure the local LLM"""
+        return ChatOllama(
             model="llama3.1:8b",
             temperature=0.0,
             max_retries=2,
             num_ctx=8192,
         )
-
-# ============================= ROSA TOOLS (ROS 2) =============================
+    
+    def _create_prompts(self):
+        """Create the system prompts for the agent"""
+        return RobotSystemPrompts(
+            embodiment_and_persona="You are a smart TurtleBot in turtlesim with a camera.",
+            about_your_capabilities=(
+                "You have access to tools, and you should always prefer using them over replying directly. "
+                "You can move forward and rotate left/right using degrees. "
+                "You have a camera and can see the environment. "
+                "Always use your available tools to answer questions and execute tasks. "
+                "Never guess or use ROS commands directly."
+            ),
+            mission_and_objectives=(
+                "Help users control the turtle and inspect the environment using available tools. "
+                "When the user gives any command that involves 'camera', 'image', 'see', 'show me', or 'feed', "
+                "you **must** call the `get_robot_camera_image` tool. Do not guess or provide manual instructions."
+            )
+        )
+    
+    def _create_tools(self):
+        """Create and return all the tools for the agent"""
+        node_instance = self  # Store reference to self for closure
+        
+        # ============================= MOVEMENT TOOLS =============================
         @tool
         def publish_linear_motion(distance: float) -> str:
             """
             Move the TurtleSim turtle forward/backward by the specified distance (in turtlesim units).
-
             """
             linear_speed = 1.0  # units/second
             
@@ -53,17 +103,17 @@ class TurtleBotAgentNode(Node):
                 twist.linear.x = linear_speed
             
                 
-            start_time = self.get_clock().now().nanoseconds
+            start_time = node_instance.get_clock().now().nanoseconds
             while rclpy.ok():
-                current_time = self.get_clock().now().nanoseconds
+                current_time = node_instance.get_clock().now().nanoseconds
                 elapsed = (current_time - start_time) / 1e9  # Convert ns to seconds
                 if elapsed >= duration:
                     break
-                self.publisher_.publish(twist)
-                rclpy.spin_once(self, timeout_sec=0.01)
+                node_instance.publisher_.publish(twist)
+                rclpy.spin_once(node_instance, timeout_sec=0.01)
 
             twist.linear.x = 0.0
-            self.publisher_.publish(twist)
+            node_instance.publisher_.publish(twist)
             return f"Moved forward {distance:.2f}."
 
         @tool
@@ -85,25 +135,25 @@ class TurtleBotAgentNode(Node):
                 twist.angular.z = angular_speed
                 direction = "right"
 
-            start_time = self.get_clock().now().nanoseconds
+            start_time = node_instance.get_clock().now().nanoseconds
             while rclpy.ok():
-                current_time = self.get_clock().now().nanoseconds
+                current_time = node_instance.get_clock().now().nanoseconds
                 elapsed = (current_time - start_time) / 1e9
                 if elapsed >= duration:
                     break
-                self.publisher_.publish(twist)
-                rclpy.spin_once(self, timeout_sec=0.01)
+                node_instance.publisher_.publish(twist)
+                rclpy.spin_once(node_instance, timeout_sec=0.01)
 
             twist.angular.z = 0.0
-            self.publisher_.publish(twist)
-            return f"Rotated {angle_radians:.0f}° to the {direction}."
+            node_instance.publisher_.publish(twist)
+            return f"Rotated {angle:.0f}° to the {direction}."
 
+        # ============================= SENSOR TOOLS =============================
         @tool
         def get_turtle_pose() -> dict:
             """
             Get the pose of the turtle (/turtle1).
             """
-
             pose_data = {}
 
             def callback(msg):
@@ -113,7 +163,7 @@ class TurtleBotAgentNode(Node):
                 pose_data["linear_velocity"] = round(msg.linear_velocity, 2)
                 pose_data["angular_velocity"] = round(msg.angular_velocity, 2)
 
-            sub = self.create_subscription(
+            sub = node_instance.create_subscription(
                 Pose,
                 "/turtle1/pose",
                 callback,
@@ -125,47 +175,14 @@ class TurtleBotAgentNode(Node):
             while time.time() - start_time < timeout:
                 if pose_data:
                     break
-                rclpy.spin_once(self, timeout_sec=0.1)
+                rclpy.spin_once(node_instance, timeout_sec=0.1)
 
             if not pose_data:
                 return {"error": "Pose not received in time."}
 
             return pose_data
 
-        @tool
-        def get_robot_camera_image() -> dict:
-            """
-            Capture and show an image from the TurtleBot's RGB camera (/turtlebot_rgb).
-            """
-            image_data = {}
-
-            def image_callback(msg):
-                try:
-                    cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-                    cv2.imshow("TurtleBot Camera View", cv_image)
-                    cv2.waitKey(1)
-                    image_data["message"] = "Image displayed in window."
-                except Exception as e:
-                    image_data["error"] = f"Failed to process image: {str(e)}"
-
-            sub = self.create_subscription(
-                Image,
-                "/turtlebot_rgb",
-                image_callback,
-                10
-            )
-
-            timeout = 5
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if "message" in image_data or "error" in image_data:
-                    break
-                rclpy.spin_once(self, timeout_sec=0.1)
-
-            if not image_data:
-                return {"error": "No image received in time."}
-
-            return image_data
+        # ============================= CAMERA TOOLS =============================
         @tool
         def get_robot_camera_image() -> dict:
             """
@@ -177,25 +194,25 @@ class TurtleBotAgentNode(Node):
 
             def image_callback(msg):
                 try:
-                    cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                    cv_image = node_instance.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
                     resized_image = cv2.resize(cv_image, (250, 250))
                     last_frame["image"] = resized_image
                 except Exception as e:
-                    self.get_logger().error(f"Image conversion failed: {str(e)}")
+                    node_instance.get_logger().error(f"Image conversion failed: {str(e)}")
 
-            sub = self.create_subscription(
+            sub = node_instance.create_subscription(
                 Image,
                 "/turtlebot_rgb",
                 image_callback,
                 10
             )
 
-            self.get_logger().info("📷 Live streaming camera... Press 'q' to quit.")
+            node_instance.get_logger().info("📷 Live streaming camera... Press 'q' to quit.")
             result = {}
 
             try:
                 while rclpy.ok() and streaming["running"]:
-                    rclpy.spin_once(self, timeout_sec=0.01)
+                    rclpy.spin_once(node_instance, timeout_sec=0.01)
 
                     frame = last_frame["image"]
                     if frame is not None:
@@ -206,52 +223,29 @@ class TurtleBotAgentNode(Node):
             except Exception as e:
                 result["error"] = f"Error during streaming: {str(e)}"
             finally:
-                self.destroy_subscription(sub)
+                node_instance.destroy_subscription(sub)
                 cv2.destroyAllWindows()
                 if "error" not in result:
                     result["message"] = "Stopped live stream."
 
             return result
-        
-              
-# ============================= AGENT SETUP =============================
-        # Prompts
-        prompts = RobotSystemPrompts(
-            embodiment_and_persona="You are a smart TurtleBot in turtlesim with a camera.",
-            about_your_capabilities=(
-                "You have access to tools, and you should always prefer using them over replying directly. "
-                "You can move forward and rotate left/right using degrees. "
-                "You have a camera and can see the environment. "
-                "Always use your available tools to answer questions and execute tasks. "
-                "Never guess or use ROS commands directly."
-            ),
-            mission_and_objectives=(
-                "Help users control the turtle and inspect the environment using available tools. "
-                "When the user gives any command that involves 'camera', 'image', 'see', 'show me', or 'feed', "
-                "you **must** call the `get_robot_camera_image` tool. Do not guess or provide manual instructions."
-            )
-        )
+            
+        # Return all tools
+        return [
+            publish_linear_motion,
+            publish_angular_motion,
+            get_turtle_pose,
+            get_robot_camera_image
+        ]
 
-        # Initialize ROSA
-        self.agent = ROSA(
-            ros_version=2,
-            llm=local_llm,
-            tools=[publish_linear_motion, 
-                    publish_angular_motion,
-                    get_turtle_pose,
-                    get_robot_camera_image],
-            prompts=prompts
-        )
 
-        self.get_logger().info("ROSA TurtleBot Agent is ready. Type a command:")
-
-# ============================= Interactive command loop =============================
-
+# ============================= MAIN FUNCTION =============================
 def main(args=None):
     rclpy.init(args=args)
     node = TurtleBotAgentNode()
 
     try:
+        # ============================= INTERACTIVE COMMAND LOOP =============================
         while rclpy.ok():
             user_input = input("🧠 Your command > ")
             if user_input.strip().lower() in ["exit", "quit"]:
@@ -265,3 +259,6 @@ def main(args=None):
     node.destroy_node()
     rclpy.shutdown()
 
+
+if __name__ == "__main__":
+    main()
