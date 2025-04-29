@@ -22,6 +22,8 @@ class TurtleBotAgentNode(Node):
         # ============================= INITIALIZE NODE =============================
         # Initialize publishers
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        # self.publisher_ = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
+
         
         # Initialize CV Bridge for image processing
         self.bridge = CvBridge()
@@ -62,7 +64,9 @@ class TurtleBotAgentNode(Node):
     def _initialize_llm(self):
         """Initialize and configure the local LLM"""
         return ChatOllama(
-            model="llama3.1:8b",
+            # model="llama3.1:8b",
+            model="qwen2.5:14b",
+            # model="mistral-nemo:12b",
             temperature=0.0,
             max_retries=2,
             num_ctx=8192,
